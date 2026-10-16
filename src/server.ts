@@ -1,5 +1,6 @@
 import express, { type Request, type Response, type NextFunction } from "express";
 import fs from "node:fs/promises";
+import { timingSafeEqual } from "node:crypto";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { ROOT } from "./sandbox.js";
@@ -17,6 +18,18 @@ const TOKEN = process.env.MCP_TOKEN;
 if (!TOKEN) {
   console.error("MCP_TOKEN is not set. Refusing to start with an open endpoint.");
   process.exit(1);
+}
+
+const URL_SECRET = process.env.URL_SECRET;
+if (!URL_SECRET || URL_SECRET.length < 32) {
+  console.error("URL_SECRET is missing or shorter than 32 chars. Refusing to start.");
+  process.exit(1);
+}
+
+function secretMatches(given: string): boolean {
+  const a = Buffer.from(given);
+  const b = Buffer.from(URL_SECRET!);
+  return a.length === b.length && timingSafeEqual(a, b);
 }
 
 function buildServer(): McpServer {
@@ -94,8 +107,16 @@ function auth(req: Request, res: Response, next: NextFunction) {
   next();
 }
 
+function urlSecretAuth(req: Request, res: Response, next: NextFunction) {
+  if (!secretMatches(String(req.params.secret ?? ""))) {
+    res.status(401).json({ error: "Unauthorized" });
+    return;
+  }
+  next();
+}
+
 // Stateless Streamable HTTP: a fresh server + transport per request
-app.post("/mcp", auth, async (req, res) => {
+async function handleMcp(req: Request, res: Response) {
   const server = buildServer();
   const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
   res.on("close", () => {
@@ -104,10 +125,18 @@ app.post("/mcp", auth, async (req, res) => {
   });
   await server.connect(transport);
   await transport.handleRequest(req, res, req.body);
-});
+}
 
-app.get("/mcp", (_req, res) => res.status(405).json({ error: "Method not allowed" }));
-app.delete("/mcp", (_req, res) => res.status(405).json({ error: "Method not allowed" }));
+// Option 1: Authorization: Bearer header (Inspector, Claude Code)
+app.post("/mcp", auth, handleMcp);
+
+// Option 2: secret in the URL path (Claude connector, which can't send headers)
+app.post("/s/:secret/mcp", urlSecretAuth, handleMcp);
+
+for (const path of ["/mcp", "/s/:secret/mcp"]) {
+  app.get(path, (_req, res) => res.status(405).json({ error: "Method not allowed" }));
+  app.delete(path, (_req, res) => res.status(405).json({ error: "Method not allowed" }));
+}
 
 await fs.mkdir(ROOT, { recursive: true });
 app.listen(PORT, () => console.log(`MCP server on http://localhost:${PORT}/mcp  (root: ${ROOT})`));
